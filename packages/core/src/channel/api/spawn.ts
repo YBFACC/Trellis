@@ -8,6 +8,12 @@ import {
   type WorkerState,
 } from "../internal/store/worker-state.js";
 import { resolveChannelRef } from "./resolve.js";
+import {
+  createProviderResumeId,
+  createWorkerId,
+  deserializeProviderResumeId,
+  deserializeWorkerId,
+} from "../id-codec.js";
 import type {
   SpawnWorkerInput,
   WorkerRuntime,
@@ -36,13 +42,24 @@ export async function spawnWorker(
     ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
   });
 
+  const workerId =
+    typeof input.workerId === "string"
+      ? createWorkerId(input.workerId)
+      : deserializeWorkerId(input.workerId);
+  const resume =
+    input.resume === undefined
+      ? undefined
+      : typeof input.resume === "string"
+        ? createProviderResumeId(input.resume)
+        : deserializeProviderResumeId(input.resume);
+
   const startInput: WorkerStartInput = {
     channel: ref,
-    workerId: input.workerId,
+    workerId,
     cwd: input.cwd,
     systemPrompt: input.systemPrompt,
     ...(input.model !== undefined ? { model: input.model } : {}),
-    ...(input.resume !== undefined ? { resume: input.resume } : {}),
+    ...(resume !== undefined ? { resume } : {}),
   };
   const handle = await runtime.start(startInput);
 
@@ -52,7 +69,7 @@ export async function spawnWorker(
     {
       kind: "spawned",
       by: input.by,
-      as: input.workerId,
+      as: workerId,
       inboxPolicy,
       ...(input.provider ?? handle.provider
         ? { provider: input.provider ?? handle.provider }
@@ -67,12 +84,12 @@ export async function spawnWorker(
   const events = await readChannelEvents(input.channel, ref.project);
   const registry = reduceWorkerRegistry(events, ref);
   const state = registry.workers.find(
-    (w) => w.workerId === input.workerId,
+    (w) => w.workerId === workerId,
   );
   if (!state) {
     // Should never happen — we just appended the spawned event.
     throw new Error(
-      `spawnWorker: worker '${input.workerId}' missing from registry after spawn`,
+      `spawnWorker: worker '${workerId}' missing from registry after spawn`,
     );
   }
   return state;

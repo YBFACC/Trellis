@@ -13,13 +13,24 @@
  */
 
 import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 
 import {
   DEFAULT_INBOX_POLICY,
+  acknowledgeStop,
+  abortDispatchedWorkerRun,
+  completeWorkerRun,
+  deserializeWorkerRunId,
+  observeWorkerRun,
+  readWorkerRunState,
+  recordReport,
+  startWorkerRun,
+  verifyWorkerRunPrompt,
   type InboxPolicy,
+  type SerializedWorkerRunId,
 } from "@mindfoldhq/trellis-core/channel";
 
 import { shouldUseSystemPromptFile } from "./adapters/claude.js";
@@ -47,7 +58,7 @@ export interface SupervisorConfig {
    *  `view.systemPromptFile` so adapters can avoid OS argv-length limits.
    *  No "initial user prompt" — the worker stays idle until the first
    *  inbox `send --to <worker>` arrives. */
-  systemPrompt: string;
+  systemPrompt?: string;
   /** Extra env vars (TRELLIS_HOOKS=0 etc. are added automatically). */
   env?: Record<string, string>;
   /** Optional model override. */
@@ -79,6 +90,47 @@ export interface SupervisorConfig {
   /** Worker inbox delivery policy (recorded on `spawned`; default
    *  `explicitOnly`). */
   inboxPolicy?: InboxPolicy;
+  /** Structured, task-owned managed dispatch; legacy configs omit this. */
+  managed?: ManagedSupervisorConfig;
+}
+
+export interface ManagedSupervisorConfig {
+  taskPath: string;
+  workerRunId: SerializedWorkerRunId;
+  promptPath: string;
+  promptSha256: string;
+}
+
+export interface ScheduleSupervisorTimeoutArgs {
+  timeoutMs: number;
+  shutdown: {
+    request(signal: NodeJS.Signals, reason: "timeout"): Promise<void>;
+  };
+  log: { write: (data: string) => void };
+  /** Managed dispatches record an observation rather than killing the worker. */
+  onManagedTimeout?: () => void;
+}
+
+/** Schedule the legacy timeout kill or a managed observation, never both. */
+export function scheduleSupervisorTimeout(
+  args: ScheduleSupervisorTimeoutArgs,
+): () => void {
+  if (args.timeoutMs <= 0) return () => undefined;
+  const timer = setTimeout(() => {
+    if (args.onManagedTimeout) {
+      args.log.write(
+        `[supervisor] timeout ${args.timeoutMs}ms reached; recording managed observation\n`,
+      );
+      args.onManagedTimeout();
+      return;
+    }
+    args.log.write(
+      `[supervisor] timeout ${args.timeoutMs}ms reached, killing worker\n`,
+    );
+    void args.shutdown.request("SIGTERM", "timeout");
+  }, args.timeoutMs);
+  timer.unref?.();
+  return () => clearTimeout(timer);
 }
 
 type Child = ChildProcessByStdio<Writable, Readable, Readable>;
@@ -100,6 +152,8 @@ export async function finalizeSupervisorExit(args: {
   abortStdoutDrain: () => void;
   onDrainTimeout?: () => void;
   finalizeOnExit: () => Promise<void>;
+  recordManagedExit?: () => Promise<void>;
+  acknowledgeManagedStop?: () => Promise<void>;
   cleanup: () => Promise<void>;
   exit: () => void;
 }): Promise<void> {
@@ -118,6 +172,8 @@ export async function finalizeSupervisorExit(args: {
   await args.stdoutDrained.catch(() => undefined);
   clearTimeout(timer);
   await args.finalizeOnExit().catch(() => undefined);
+  await args.recordManagedExit?.().catch(() => undefined);
+  await args.acknowledgeManagedStop?.().catch(() => undefined);
   await args.cleanup().catch(() => undefined);
   args.exit();
 }
@@ -181,6 +237,20 @@ export async function runSupervisor(
   configPath: string,
 ): Promise<void> {
   const config = readConfig(configPath);
+  const managed = config.managed;
+  let systemPrompt: string;
+  try {
+    systemPrompt = await resolveSupervisorSystemPrompt(config);
+  } catch (error) {
+    if (managed !== undefined) {
+      await abortDispatchedWorkerRun({
+        taskPath: managed.taskPath,
+        workerRunId: managed.workerRunId,
+        reason: "managed prompt verification failed",
+      }).catch(() => undefined);
+    }
+    throw error;
+  }
 
   // Self-pid file lets `trellis channel kill` find us.
   const project = process.env.TRELLIS_CHANNEL_PROJECT;
@@ -200,20 +270,23 @@ export async function runSupervisor(
   // Claude Code installs older than v2.0.34 (no --append-system-prompt-file)
   // keep working exactly as before; adapters that do support a file-based
   // prompt flag (claude: --append-system-prompt-file) prefer it.
-  let systemPromptFile: string | undefined;
-  if (shouldUseSystemPromptFile(config.systemPrompt)) {
+  let systemPromptFile: string | undefined = managed?.promptPath;
+  if (
+    systemPromptFile === undefined &&
+    shouldUseSystemPromptFile(systemPrompt)
+  ) {
     systemPromptFile = workerFile(
       channelName,
       workerName,
       "system-prompt.md",
       project,
     );
-    fs.writeFileSync(systemPromptFile, config.systemPrompt);
+    fs.writeFileSync(systemPromptFile, systemPrompt);
   }
   const view = {
     resume: config.resume,
     model: config.model,
-    systemPrompt: config.systemPrompt,
+    systemPrompt,
     ...(systemPromptFile ? { systemPromptFile } : {}),
     cwd: config.cwd,
     sandbox: config.sandbox,
@@ -341,6 +414,13 @@ export async function runSupervisor(
         } catch {
           // ignore — we're exiting anyway
         }
+        if (managed !== undefined) {
+          await abortDispatchedWorkerRun({
+            taskPath: managed.taskPath,
+            workerRunId: managed.workerRunId,
+            reason: `provider launch failed: ${err.message}`,
+          }).catch(() => undefined);
+        }
         await cleanup(channelName, workerName).catch(() => undefined);
         process.exit(1);
       })();
@@ -387,6 +467,20 @@ export async function runSupervisor(
           `[supervisor] stdout did not close within ${SHUTDOWN_GRACE_MS}ms; draining buffered lines and exiting\n`,
         ),
       finalizeOnExit: () => shutdown.finalizeOnExit(code, sig),
+      ...(managed !== undefined
+        ? {
+            recordManagedExit: async () => {
+              await finalizeManagedWorkerRun(managed, code, sig);
+            },
+          }
+        : {}),
+      ...(managed !== undefined
+        ? {
+            acknowledgeManagedStop: async () => {
+              await acknowledgeManagedStopIfRequested(managed);
+            },
+          }
+        : {}),
       cleanup: () => cleanup(channelName, workerName),
       exit: () => process.exit(0),
     });
@@ -451,8 +545,21 @@ export async function runSupervisor(
       },
       project,
     );
+    if (managed !== undefined) {
+      await startWorkerRun({
+        taskPath: managed.taskPath,
+        workerRunId: managed.workerRunId,
+      });
+    }
   } catch (err) {
     stdoutDrain.discard();
+    if (managed !== undefined) {
+      await abortDispatchedWorkerRun({
+        taskPath: managed.taskPath,
+        workerRunId: managed.workerRunId,
+        reason: "failed to mark durable supervisor spawn",
+      }).catch(() => undefined);
+    }
     throw err;
   }
 
@@ -465,20 +572,48 @@ export async function runSupervisor(
     shutdown,
     isChildExited: () => child.exitCode !== null || child.signalCode !== null,
     log,
+    ...(managed !== undefined
+      ? {
+          onIdleTimeout: () => {
+            void observeManagedWorkerRun(
+              managed,
+              "silent",
+              {
+                reason: "idle-timeout",
+                idleTimeoutMs: config.idleTimeoutMs ?? 0,
+              },
+              log,
+            );
+          },
+        }
+      : {}),
   });
   process.on("exit", () => idleTimerRef.current?.cancel());
   stdoutDrain.allowProcessing();
 
   // ── timeout guard (anti-zombie) ──
   if (config.timeoutMs && config.timeoutMs > 0) {
-    setTimeout(() => {
-      log.write(
-        `[supervisor] timeout ${config.timeoutMs}ms reached, killing worker\n`,
-      );
-      // shutdown.request emits a single `killed{reason:"timeout"}` event;
-      // no need to emit a separate one here.
-      void shutdown.request("SIGTERM", "timeout");
-    }, config.timeoutMs).unref();
+    const cancelTimeout = scheduleSupervisorTimeout({
+      timeoutMs: config.timeoutMs,
+      shutdown,
+      log,
+      ...(managed !== undefined
+        ? {
+            onManagedTimeout: () => {
+              void observeManagedWorkerRun(
+                managed,
+                "wait_timeout",
+                {
+                  reason: "timeout",
+                  timeoutMs: config.timeoutMs,
+                },
+                log,
+              );
+            },
+          }
+        : {}),
+    });
+    process.on("exit", cancelTimeout);
 
     // Fire-and-forget pre-timeout observability warning. One-shot, guarded
     // by shutdown/terminal/exit state so it stays quiet once the worker is
@@ -608,6 +743,115 @@ export function writeSupervisorConfig(
 ): string {
   const p = workerFile(channelName, workerName, "config", project);
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify(config, null, 2), "utf-8");
+  const tempPath = path.join(
+    path.dirname(p),
+    `.${path.basename(p)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    fs.writeFileSync(tempPath, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
+    fs.renameSync(tempPath, p);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      // no temp file to clean up
+    }
+    throw error;
+  }
   return p;
+}
+
+/** Resolve the prompt without interpreting it as executable source. */
+export async function resolveSupervisorSystemPrompt(
+  config: SupervisorConfig,
+): Promise<string> {
+  if (config.managed !== undefined) {
+    return verifyWorkerRunPrompt({
+      taskPath: config.managed.taskPath,
+      workerRunId: config.managed.workerRunId,
+      promptPath: config.managed.promptPath,
+      promptSha256: config.managed.promptSha256,
+    });
+  }
+  if (config.systemPrompt === undefined) {
+    throw new Error("Supervisor config is missing systemPrompt");
+  }
+  return config.systemPrompt;
+}
+
+async function observeManagedWorkerRun(
+  managed: ManagedSupervisorConfig,
+  kind: "silent" | "wait_timeout",
+  detail: Record<string, unknown>,
+  log: { write: (data: string) => void },
+): Promise<void> {
+  try {
+    await observeWorkerRun({
+      taskPath: managed.taskPath,
+      workerRunId: managed.workerRunId,
+      kind,
+      detail,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log.write(`[supervisor] managed observation failed: ${message}\n`);
+  }
+}
+
+async function acknowledgeManagedStopIfRequested(
+  managed: ManagedSupervisorConfig,
+): Promise<void> {
+  const workerRunId = deserializeWorkerRunId(managed.workerRunId);
+  const state = await readWorkerRunState({ taskPath: managed.taskPath });
+  const run = state.runs.find(
+    (candidate) => candidate.workerRunId === workerRunId,
+  );
+  if (run?.lifecycle !== "stop_requested") return;
+  await acknowledgeStop({
+    taskPath: managed.taskPath,
+    workerRunId,
+    outcome: "cancelled",
+    reason: "supervisor exited after graceful stop",
+  });
+}
+
+/**
+ * Map a managed child terminal exit into the durable control-plane lifecycle.
+ * Cooperative stops are acknowledged separately so they can retain their stop
+ * reason; a normal successful process exit is the terminal report
+ * acknowledgement for this channel-managed dispatch.
+ */
+export async function finalizeManagedWorkerRun(
+  managed: ManagedSupervisorConfig,
+  code: number | null,
+  signal: NodeJS.Signals | null,
+): Promise<void> {
+  const workerRunId = deserializeWorkerRunId(managed.workerRunId);
+  const state = await readWorkerRunState({ taskPath: managed.taskPath });
+  const run = state.runs.find(
+    (candidate) => candidate.workerRunId === workerRunId,
+  );
+  if (run === undefined || run.lifecycle === "stop_requested") return;
+  if (code === 0) {
+    if (run.lifecycle === "running") {
+      await recordReport({ taskPath: managed.taskPath, workerRunId });
+    }
+    if (run.lifecycle === "running" || run.lifecycle === "report_pending") {
+      await completeWorkerRun({
+        taskPath: managed.taskPath,
+        workerRunId,
+        outcome: "completed",
+        reason: "worker exited after report acknowledgement",
+      });
+    }
+    return;
+  }
+  if (run.lifecycle === "running" || run.lifecycle === "report_pending") {
+    await completeWorkerRun({
+      taskPath: managed.taskPath,
+      workerRunId,
+      outcome: "failed",
+      reason: `worker exited with code=${code ?? "null"} signal=${signal ?? "null"}`,
+    });
+  }
 }

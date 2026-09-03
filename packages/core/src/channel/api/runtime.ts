@@ -18,26 +18,31 @@ import type {
   ChannelScope,
   InboxPolicy,
 } from "../internal/store/schema.js";
+import type {
+  ProviderResumeId,
+  SerializedChannelId,
+  WorkerId,
+} from "../id-codec.js";
 
 export interface WorkerStartInput {
   channel: ChannelRef;
-  workerId: string;
+  workerId: WorkerId;
   cwd: string;
   systemPrompt: string;
   model?: string;
-  resume?: string;
+  resume?: ProviderResumeId;
   env?: Record<string, string>;
 }
 
 export interface WorkerRuntimeHandle {
-  workerId: string;
+  workerId: WorkerId;
   provider?: string;
   pid?: number;
   startedAt: string;
 }
 
 export interface WorkerInterruptInput {
-  workerId: string;
+  workerId: WorkerId;
   turnId?: string;
   reason?: InterruptReason;
   message?: string;
@@ -50,7 +55,7 @@ export interface WorkerInterruptResult {
 }
 
 export interface WorkerStopInput {
-  workerId: string;
+  workerId: WorkerId;
   reason: "explicit-kill" | "timeout" | "crash" | "shutdown";
   signal?: NodeJS.Signals;
   force?: boolean;
@@ -74,12 +79,13 @@ export interface SpawnWorkerInput {
   projectKey?: string;
   cwd: string;
   by: string;
-  workerId: string;
+  /** Legacy string aliases remain accepted; tagged JSON is validated at ingress. */
+  workerId: string | SerializedChannelId;
   provider?: string;
   agent?: string;
   systemPrompt: string;
   model?: string;
-  resume?: string;
+  resume?: string | SerializedChannelId;
   inboxPolicy?: InboxPolicy;
   timeoutMs?: number;
   meta?: Record<string, unknown>;

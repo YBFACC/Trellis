@@ -3,10 +3,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   channelCursorKey,
   createChannel,
+  createSubmissionId,
+  createWorkerId,
+  createWorkerRunId,
   interruptWorker,
   listWorkers,
   readChannelEvents,
   requestInterrupt,
+  serializeSubmissionId,
+  serializeWorkerId,
+  serializeWorkerRunId,
   sendMessage,
   spawnWorker,
   watchChannels,
@@ -273,6 +279,67 @@ describe("spawnWorker / interrupt APIs", () => {
     });
   });
 
+  it("rejects a tagged non-worker ID before calling the provider runtime", async () => {
+    await createChannel({ channel: "c", by: "main" });
+    let started = false;
+    const runtime: WorkerRuntime = {
+      start: async (input) => {
+        started = true;
+        return {
+          workerId: input.workerId,
+          startedAt: new Date().toISOString(),
+        };
+      },
+    };
+
+    await expect(
+      spawnWorker(
+        {
+          channel: "c",
+          cwd: env.projectDir,
+          by: "main",
+          workerId: serializeSubmissionId(createSubmissionId("submission-a")),
+          systemPrompt: "x",
+        },
+        runtime,
+      ),
+    ).rejects.toThrow(
+      expect.objectContaining({ code: "worker_id_type_mismatch" }),
+    );
+    expect(started).toBe(false);
+  });
+
+  it("rejects a tagged non-resume ID before calling the provider runtime", async () => {
+    await createChannel({ channel: "c", by: "main" });
+    let started = false;
+    const runtime: WorkerRuntime = {
+      start: async (input) => {
+        started = true;
+        return {
+          workerId: input.workerId,
+          startedAt: new Date().toISOString(),
+        };
+      },
+    };
+
+    await expect(
+      spawnWorker(
+        {
+          channel: "c",
+          cwd: env.projectDir,
+          by: "main",
+          workerId: "worker-a",
+          resume: serializeWorkerId(createWorkerId("worker-a")),
+          systemPrompt: "x",
+        },
+        runtime,
+      ),
+    ).rejects.toThrow(
+      expect.objectContaining({ code: "provider_resume_id_type_mismatch" }),
+    );
+    expect(started).toBe(false);
+  });
+
   it("requestInterrupt appends a durable-only interrupt_requested event", async () => {
     await createChannel({ channel: "c", by: "main" });
     const evt = await requestInterrupt({
@@ -284,6 +351,33 @@ describe("spawnWorker / interrupt APIs", () => {
     expect(evt.kind).toBe("interrupt_requested");
     const events = await readChannelEvents({ channel: "c" });
     expect(events.filter((e) => e.kind === "interrupted")).toHaveLength(0);
+  });
+
+  it("rejects a tagged non-worker ID before registry, event, or runtime interrupt work", async () => {
+    await createChannel({ channel: "c", by: "main" });
+    let interrupted = false;
+    const runtime: WorkerRuntime = {
+      start: fakeRuntime.start,
+      interrupt: async () => {
+        interrupted = true;
+        return { method: "provider", outcome: "interrupted" };
+      },
+    };
+
+    await expect(
+      interruptWorker(
+        {
+          channel: "c",
+          by: "main",
+          workerId: serializeWorkerRunId(createWorkerRunId("run-a")),
+        },
+        runtime,
+      ),
+    ).rejects.toThrow(
+      expect.objectContaining({ code: "worker_id_type_mismatch" }),
+    );
+    expect(interrupted).toBe(false);
+    expect(await readChannelEvents({ channel: "c" })).toHaveLength(1);
   });
 
   it("interruptWorker orchestrates runtime interrupt and records outcome", async () => {

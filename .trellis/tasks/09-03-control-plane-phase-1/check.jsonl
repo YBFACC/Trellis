@@ -1,0 +1,5 @@
+{"file":".trellis/spec/core/backend/index.md","reason":"Verify core channel public API boundaries."}
+{"file":".trellis/spec/cli/backend/trellis-core-sdk.md","reason":"Verify core and CLI separation."}
+{"file":".trellis/spec/cli/backend/commands-channel.md","reason":"Verify channel lifecycle compatibility."}
+{"file":".trellis/spec/cli/backend/filesystem-safety.md","reason":"Verify atomic task-local writes and safe paths."}
+{"file":".trellis/spec/cli/unit-test/conventions.md","reason":"Verify focused regression coverage."}

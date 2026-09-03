@@ -1,0 +1,5 @@
+{"file":".trellis/spec/core/backend/index.md","reason":"Core channel API and public export boundaries."}
+{"file":".trellis/spec/cli/backend/trellis-core-sdk.md","reason":"Core and CLI ownership contract."}
+{"file":".trellis/spec/cli/backend/commands-channel.md","reason":"Channel supervisor, event, and CLI constraints."}
+{"file":".trellis/spec/cli/backend/filesystem-safety.md","reason":"Task-local durable state and prompt write safety."}
+{"file":".trellis/spec/cli/unit-test/conventions.md","reason":"Core and CLI test conventions."}

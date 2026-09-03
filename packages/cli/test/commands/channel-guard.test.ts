@@ -4,6 +4,15 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  createWorkerId,
+  createWorkerRunId,
+  dispatchWorkerRun,
+  readWorkerRunState,
+  serializeWorkerRunId,
+  startWorkerRun,
+} from "@mindfoldhq/trellis-core/channel";
+
 import { createChannel } from "../../src/commands/channel/create.js";
 import {
   DEFAULT_IDLE_TTL_MS,
@@ -423,6 +432,79 @@ describe("scanLiveWorkers + enforceSpawnBudget (integration)", () => {
       (m) => m.readChannelEvents("c3", env.projectKey),
     );
     expect(events.some((e) => e.kind === "killed")).toBe(false);
+  });
+
+  it("records an observation instead of signaling managed idle workers", async () => {
+    const taskPath = path.join(env.projectDir, ".trellis", "tasks", "managed");
+    fs.mkdirSync(taskPath, { recursive: true });
+    const dispatched = await dispatchWorkerRun({
+      taskPath,
+      workerRunId: createWorkerRunId("run-managed-guard"),
+      workerId: createWorkerId("w-managed"),
+      role: "implement",
+      packageId: "core-channel",
+      writeScope: ["packages/core/**"],
+      findingIds: [],
+      roundId: "round-guard",
+      prompt: "guard",
+    });
+    await startWorkerRun({
+      taskPath,
+      workerRunId: createWorkerRunId("run-managed-guard"),
+    });
+    await createChannel("managed-idle", { by: "main" });
+    await appendEvent(
+      "managed-idle",
+      {
+        kind: "spawned",
+        by: "main",
+        as: "w-managed",
+        ts: "2026-05-17T00:00:00.000Z",
+      },
+      env.projectKey,
+    );
+    writeLivePid(env.channelsRoot, env.projectKey, "managed-idle", "w-managed");
+    fs.writeFileSync(
+      workerFile("managed-idle", "w-managed", "config", env.projectKey),
+      JSON.stringify({
+        managed: {
+          taskPath,
+          workerRunId: serializeWorkerRunId(dispatched.run.workerRunId),
+        },
+      }),
+      "utf8",
+    );
+    const sentSignals: NodeJS.Signals[] = [];
+    const killSpy = vi
+      .spyOn(process, "kill")
+      .mockImplementation((_pid: number, sig?: number | NodeJS.Signals) => {
+        if (sig === 0 || sig === undefined) return true;
+        sentSignals.push(sig);
+        return true;
+      });
+
+    const live = scanLiveWorkers({
+      projectKey: env.projectKey,
+      isSupervisorProcess: verifySupervisor,
+    });
+    const result = await cleanupExpiredIdleWorkers(live, 60_000, {
+      project: env.projectKey,
+      now: Date.parse("2026-05-17T01:00:00.000Z"),
+    });
+
+    expect(result.killed).toEqual([]);
+    expect(sentSignals).not.toContain("SIGTERM");
+    const state = await readWorkerRunState({ taskPath });
+    expect(state.runs[0]).toMatchObject({
+      lifecycle: "running",
+      observations: [
+        {
+          kind: "silent",
+          detail: { reason: "idle-timeout", source: "spawn-guard" },
+        },
+      ],
+    });
+    killSpy.mockRestore();
   });
 
   it("enforceSpawnBudget cleans expired idle workers, then permits a spawn", async () => {

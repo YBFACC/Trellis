@@ -1,5 +1,12 @@
 import fs from "node:fs";
 
+import {
+  abortDispatchedWorkerRun,
+  acknowledgeStop,
+  completeWorkerRun,
+  requestGracefulStop,
+} from "@mindfoldhq/trellis-core/channel";
+
 import { appendEvent } from "./store/events.js";
 import { withLock } from "./store/lock.js";
 import {
@@ -8,6 +15,10 @@ import {
   workerLockPath,
 } from "./store/paths.js";
 import { parseChannelScope } from "./store/schema.js";
+import type {
+  ManagedSupervisorConfig,
+  SupervisorConfig,
+} from "./supervisor.js";
 
 export interface KillOptions {
   as: string;
@@ -47,6 +58,7 @@ async function killLocked(
     );
   }
   const supervisorPid = Number(fs.readFileSync(pidPath, "utf-8").trim());
+  const managed = readManagedSupervisorConfig(channelName, opts.as, project);
   if (!supervisorPid || !alive(supervisorPid)) {
     await appendEvent(
       channelName,
@@ -58,7 +70,33 @@ async function killLocked(
       },
       project,
     );
+    if (managed !== undefined) {
+      await terminalizeManagedRuntime(
+        managed,
+        "confirmed dead runtime",
+        "failed",
+      );
+    }
     cleanupFiles(channelName, opts.as, project);
+    return;
+  }
+
+  if (!opts.force && managed !== undefined) {
+    await requestGracefulStop({
+      taskPath: managed.taskPath,
+      workerRunId: managed.workerRunId,
+      reason: "explicit-kill",
+    });
+    await appendEvent(
+      channelName,
+      {
+        kind: "message",
+        by: "cli:kill",
+        to: opts.as,
+        text: "A graceful stop was requested. Finish safely, acknowledge the stop, and do not begin new work.",
+      },
+      project,
+    );
     return;
   }
 
@@ -136,7 +174,53 @@ async function killLocked(
     );
   }
 
+  if (opts.force && managed !== undefined) {
+    await terminalizeManagedRuntime(managed, "force kill", "cancelled");
+  }
+
   cleanupFiles(channelName, opts.as, project);
+}
+
+async function terminalizeManagedRuntime(
+  managed: ManagedSupervisorConfig,
+  reason: string,
+  outcome: "failed" | "cancelled",
+): Promise<void> {
+  await acknowledgeStop({
+    taskPath: managed.taskPath,
+    workerRunId: managed.workerRunId,
+    outcome,
+    reason,
+  }).catch(async () => {
+    await completeWorkerRun({
+      taskPath: managed.taskPath,
+      workerRunId: managed.workerRunId,
+      outcome,
+      reason,
+    }).catch(async () => {
+      await abortDispatchedWorkerRun({
+        taskPath: managed.taskPath,
+        workerRunId: managed.workerRunId,
+        reason: `${reason} before runtime start`,
+      }).catch(() => undefined);
+    });
+  });
+}
+
+function readManagedSupervisorConfig(
+  channelName: string,
+  worker: string,
+  project: string,
+): ManagedSupervisorConfig | undefined {
+  try {
+    const configPath = workerFile(channelName, worker, "config", project);
+    const config = JSON.parse(
+      fs.readFileSync(configPath, "utf8"),
+    ) as SupervisorConfig;
+    return config.managed;
+  } catch {
+    return undefined;
+  }
 }
 
 function alive(pid: number): boolean {

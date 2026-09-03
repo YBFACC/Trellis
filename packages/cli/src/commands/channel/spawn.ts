@@ -2,8 +2,18 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 
-import type { InboxPolicy } from "@mindfoldhq/trellis-core/channel";
+import {
+  createProviderResumeId,
+  createWorkerId,
+  createWorkerRunId,
+  abortDispatchedWorkerRun,
+  dispatchWorkerRun,
+  normalizeWorkerRunRole,
+  serializeWorkerRunId,
+  type InboxPolicy,
+} from "@mindfoldhq/trellis-core/channel";
 
 import { loadAgent } from "./agent-loader.js";
 import type { CodexSandboxMode } from "./adapters/codex.js";
@@ -24,7 +34,10 @@ import {
   workerLockPath,
 } from "./store/paths.js";
 import { parseChannelScope } from "./store/schema.js";
-import { writeSupervisorConfig } from "./supervisor.js";
+import {
+  writeSupervisorConfig,
+  type ManagedSupervisorConfig,
+} from "./supervisor.js";
 
 export interface SpawnOptions {
   provider?: Provider;
@@ -59,6 +72,15 @@ export interface SpawnOptions {
    * spawn-time budget check. Overrides env / config / built-in default.
    */
   maxLiveWorkers?: number;
+  /** Explicit task path opts into the structured managed-dispatch path. */
+  taskPath?: string;
+  packageId?: string;
+  writeScope?: string[];
+  findingIds?: string[];
+  previousReportPath?: string;
+  lastEvidence?: string;
+  roundId?: string;
+  predecessorWorkerRunId?: string;
 }
 
 interface ResolvedSpawn {
@@ -68,12 +90,14 @@ interface ResolvedSpawn {
   model?: string;
   contextFiles: string[];
   contextManifests: string[];
+  agentName?: string;
 }
 
 function resolveSpawn(channelName: string, opts: SpawnOptions): ResolvedSpawn {
   const cwd = opts.cwd ?? process.cwd();
   const trustedRoots = resolveTrustedRoots(cwd);
   let agentBody: string | undefined;
+  let agentName: string | undefined;
   let provider = opts.provider;
   let model = opts.model;
   let as = opts.as;
@@ -81,6 +105,7 @@ function resolveSpawn(channelName: string, opts: SpawnOptions): ResolvedSpawn {
   if (opts.agent) {
     const agent = loadAgent(opts.agent, cwd, trustedRoots);
     agentBody = agent.systemPrompt || undefined;
+    agentName = agent.name;
     provider = provider ?? agent.provider;
     model = model ?? agent.model;
     as = as ?? agent.name;
@@ -110,6 +135,7 @@ function resolveSpawn(channelName: string, opts: SpawnOptions): ResolvedSpawn {
     model,
     contextFiles: context.paths,
     contextManifests: context.manifests,
+    ...(agentName !== undefined ? { agentName } : {}),
   };
 }
 
@@ -256,31 +282,7 @@ async function spawnLocked(
       ? process.env.TRELLIS_CHANNEL_AS
       : "main");
 
-  const configPath = writeSupervisorConfig(
-    channelName,
-    resolved.as,
-    {
-      provider: resolved.provider,
-      cwd: opts.cwd ?? process.cwd(),
-      systemPrompt: resolved.systemPrompt,
-      model: resolved.model,
-      resume: opts.resume,
-      sandbox: opts.sandbox,
-      timeoutMs: opts.timeoutMs,
-      warnBeforeMs: opts.warnBeforeMs,
-      idleTimeoutMs,
-      spawnedBy,
-      ...(opts.inboxPolicy ? { inboxPolicy: opts.inboxPolicy } : {}),
-      ...(opts.agent ? { agent: opts.agent } : {}),
-      ...(resolved.contextFiles.length > 0
-        ? { contextFiles: resolved.contextFiles }
-        : {}),
-      ...(resolved.contextManifests.length > 0
-        ? { contextManifests: resolved.contextManifests }
-        : {}),
-    },
-    project,
-  );
+  const managed = await prepareManagedDispatch(resolved, opts);
 
   const supervisorBinary = resolveCliEntry();
   const reservationPath = workerFile(
@@ -289,15 +291,65 @@ async function spawnLocked(
     "reservation",
     project,
   );
-  fs.writeFileSync(
-    reservationPath,
-    JSON.stringify({
-      channel: channelName,
-      worker: resolved.as,
-      createdAt: new Date().toISOString(),
-    }),
-    "utf-8",
-  );
+  let configPath: string | undefined;
+  try {
+    configPath = writeSupervisorConfig(
+      channelName,
+      resolved.as,
+      {
+        provider: resolved.provider,
+        cwd: opts.cwd ?? process.cwd(),
+        ...(managed === undefined
+          ? { systemPrompt: resolved.systemPrompt }
+          : {}),
+        model: resolved.model,
+        resume: opts.resume,
+        sandbox: opts.sandbox,
+        timeoutMs: opts.timeoutMs,
+        warnBeforeMs: opts.warnBeforeMs,
+        idleTimeoutMs,
+        spawnedBy,
+        ...(opts.inboxPolicy ? { inboxPolicy: opts.inboxPolicy } : {}),
+        ...(opts.agent ? { agent: opts.agent } : {}),
+        ...(resolved.contextFiles.length > 0
+          ? { contextFiles: resolved.contextFiles }
+          : {}),
+        ...(resolved.contextManifests.length > 0
+          ? { contextManifests: resolved.contextManifests }
+          : {}),
+        ...(managed !== undefined ? { managed } : {}),
+      },
+      project,
+    );
+    fs.writeFileSync(
+      reservationPath,
+      JSON.stringify({
+        channel: channelName,
+        worker: resolved.as,
+        createdAt: new Date().toISOString(),
+      }),
+      "utf-8",
+    );
+  } catch (error) {
+    if (configPath !== undefined) {
+      try {
+        fs.unlinkSync(configPath);
+      } catch {
+        // config was never made durable or has already been removed
+      }
+    }
+    try {
+      fs.unlinkSync(reservationPath);
+    } catch {
+      // reservation was never written or has already been removed
+    }
+    await abortManagedDispatch(managed, "supervisor config preparation failed");
+    throw error;
+  }
+  if (configPath === undefined) {
+    throw new Error("Supervisor config was not created");
+  }
+  const supervisorConfigPath = configPath;
   const child = spawn(
     process.execPath,
     [
@@ -306,7 +358,7 @@ async function spawnLocked(
       "__supervisor",
       channelName,
       resolved.as,
-      configPath,
+      supervisorConfigPath,
     ],
     {
       detached: true,
@@ -336,7 +388,7 @@ async function spawnLocked(
       settled = true;
       // Clean up partial config before bubbling the failure up.
       try {
-        fs.unlinkSync(configPath);
+        fs.unlinkSync(supervisorConfigPath);
       } catch {
         // ignore
       }
@@ -345,11 +397,14 @@ async function spawnLocked(
       } catch {
         // ignore
       }
-      reject(
-        new Error(
-          `Failed to launch supervisor for worker '${resolved.as}': ${err.message}`,
-        ),
-      );
+      void (async () => {
+        await abortManagedDispatch(managed, "supervisor fork failed");
+        reject(
+          new Error(
+            `Failed to launch supervisor for worker '${resolved.as}': ${err.message}`,
+          ),
+        );
+      })();
     });
   });
   if (child.pid !== undefined) {
@@ -364,6 +419,74 @@ async function spawnLocked(
   };
   console.log(JSON.stringify(result));
   return result;
+}
+
+async function abortManagedDispatch(
+  managed: ManagedSupervisorConfig | undefined,
+  reason: string,
+): Promise<void> {
+  if (managed === undefined) return;
+  await abortDispatchedWorkerRun({
+    taskPath: managed.taskPath,
+    workerRunId: managed.workerRunId,
+    reason,
+  }).catch(() => undefined);
+}
+
+async function prepareManagedDispatch(
+  resolved: ResolvedSpawn,
+  opts: SpawnOptions,
+): Promise<ManagedSupervisorConfig | undefined> {
+  if (opts.taskPath === undefined) return undefined;
+  if (resolved.agentName === undefined) {
+    throw new Error(
+      "Managed --task dispatch requires --agent to derive its role",
+    );
+  }
+  if (
+    opts.packageId === undefined ||
+    opts.writeScope === undefined ||
+    opts.writeScope.length === 0 ||
+    opts.roundId === undefined
+  ) {
+    throw new Error(
+      "Managed --task dispatch requires --package-id, at least one --write-scope, and --round-id",
+    );
+  }
+  const taskPath = path.resolve(opts.cwd ?? process.cwd(), opts.taskPath);
+  const dispatched = await dispatchWorkerRun({
+    taskPath,
+    workerRunId: createWorkerRunId(`run-${randomUUID()}`),
+    workerId: createWorkerId(resolved.as),
+    role: normalizeWorkerRunRole(resolved.agentName),
+    packageId: opts.packageId,
+    writeScope: opts.writeScope,
+    findingIds: opts.findingIds ?? [],
+    ...(opts.previousReportPath !== undefined
+      ? { previousReportPath: opts.previousReportPath }
+      : {}),
+    ...(opts.lastEvidence !== undefined
+      ? { lastEvidence: opts.lastEvidence }
+      : {}),
+    roundId: opts.roundId,
+    ...(opts.predecessorWorkerRunId !== undefined
+      ? {
+          predecessorWorkerRunId: createWorkerRunId(
+            opts.predecessorWorkerRunId,
+          ),
+        }
+      : {}),
+    ...(opts.resume !== undefined
+      ? { providerResumeId: createProviderResumeId(opts.resume) }
+      : {}),
+    prompt: resolved.systemPrompt,
+  });
+  return {
+    taskPath,
+    workerRunId: serializeWorkerRunId(dispatched.run.workerRunId),
+    promptPath: dispatched.promptPath,
+    promptSha256: dispatched.promptSha256,
+  };
 }
 
 function processAlive(pid: number): boolean {

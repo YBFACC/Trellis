@@ -5,6 +5,12 @@ import {
   type InterruptReason,
 } from "../internal/store/events.js";
 import { reduceWorkerRegistry } from "../internal/store/worker-state.js";
+import {
+  createWorkerId,
+  deserializeWorkerId,
+  type SerializedChannelId,
+  type WorkerId,
+} from "../id-codec.js";
 import { resolveChannelRef } from "./resolve.js";
 import type { WorkerInterruptResult, WorkerRuntime } from "./runtime.js";
 import type { ChannelAddressOptions, MutationCommonOptions } from "./types.js";
@@ -12,7 +18,8 @@ import type { ChannelAddressOptions, MutationCommonOptions } from "./types.js";
 export interface InterruptWorkerInput
   extends ChannelAddressOptions,
     MutationCommonOptions {
-  workerId: string;
+  /** Legacy string aliases remain accepted; tagged JSON is validated at ingress. */
+  workerId: string | SerializedChannelId;
   message?: string;
   reason?: InterruptReason;
 }
@@ -37,6 +44,7 @@ export interface InterruptWorkerResult {
 export async function requestInterrupt(
   input: InterruptWorkerInput,
 ): Promise<ChannelEvent> {
+  const workerId = asWorkerId(input.workerId);
   const ref = resolveChannelRef({
     channel: input.channel,
     ...(input.scope !== undefined ? { scope: input.scope } : {}),
@@ -50,7 +58,7 @@ export async function requestInterrupt(
     {
       kind: "interrupt_requested",
       by: input.by,
-      worker: input.workerId,
+      worker: workerId,
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
       ...(input.message !== undefined ? { message: input.message } : {}),
       ...(input.origin !== undefined ? { origin: input.origin } : {}),
@@ -73,6 +81,7 @@ export async function interruptWorker(
   input: InterruptWorkerInput,
   runtime: WorkerRuntime,
 ): Promise<InterruptWorkerResult> {
+  const workerId = asWorkerId(input.workerId);
   const ref = resolveChannelRef({
     channel: input.channel,
     ...(input.scope !== undefined ? { scope: input.scope } : {}),
@@ -84,7 +93,7 @@ export async function interruptWorker(
 
   const events = await readChannelEvents(input.channel, ref.project);
   const registry = reduceWorkerRegistry(events);
-  const worker = registry.workers.find((w) => w.workerId === input.workerId);
+  const worker = registry.workers.find((w) => w.workerId === workerId);
 
   const turnId = worker?.activeTurnId;
   const requestEvent = await appendEvent(
@@ -92,7 +101,7 @@ export async function interruptWorker(
     {
       kind: "interrupt_requested",
       by: input.by,
-      worker: input.workerId,
+      worker: workerId,
       ...(turnId !== undefined ? { turnId } : {}),
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
       ...(input.message !== undefined ? { message: input.message } : {}),
@@ -119,7 +128,7 @@ export async function interruptWorker(
 
   const result: WorkerInterruptResult = runtime.interrupt
     ? await runtime.interrupt({
-        workerId: input.workerId,
+        workerId,
         ...(turnId !== undefined ? { turnId } : {}),
         ...(input.reason !== undefined ? { reason: input.reason } : {}),
         ...(input.message !== undefined ? { message: input.message } : {}),
@@ -131,7 +140,7 @@ export async function interruptWorker(
     {
       kind: "interrupted",
       by: input.by,
-      worker: input.workerId,
+      worker: workerId,
       method: result.method,
       outcome: result.outcome,
       ...(turnId !== undefined ? { turnId } : {}),
@@ -153,4 +162,8 @@ export async function interruptWorker(
     interrupted: result.outcome === "interrupted",
     delivery,
   };
+}
+
+function asWorkerId(value: string | SerializedChannelId): WorkerId {
+  return typeof value === "string" ? createWorkerId(value) : deserializeWorkerId(value);
 }

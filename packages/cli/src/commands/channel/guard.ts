@@ -18,7 +18,9 @@ import path from "node:path";
 
 import {
   isTerminalLifecycle,
+  observeWorkerRun,
   reduceWorkerRegistry,
+  type SerializedChannelId,
   type ChannelEvent,
   type WorkerState,
 } from "@mindfoldhq/trellis-core/channel";
@@ -497,6 +499,11 @@ export interface CleanupResult {
   failed: { worker: LiveWorker; error: string }[];
 }
 
+interface ManagedGuardConfig {
+  taskPath: string;
+  workerRunId: SerializedChannelId;
+}
+
 /**
  * Kill workers whose idle TTL has expired. Writes a one-shot shutdown
  * reason sidecar before signalling the supervisor so the supervisor's
@@ -525,6 +532,20 @@ export async function cleanupExpiredIdleWorkers(
       ) {
         continue;
       }
+      const managed = readManagedGuardConfig(
+        live.channel,
+        live.workerId,
+        project,
+      );
+      if (managed !== undefined) {
+        await observeWorkerRun({
+          taskPath: managed.taskPath,
+          workerRunId: managed.workerRunId,
+          kind: "silent",
+          detail: { reason: "idle-timeout", source: "spawn-guard" },
+        }).catch(() => undefined);
+        continue;
+      }
       const reasonFile = workerFile(
         live.channel,
         live.workerId,
@@ -551,6 +572,40 @@ export async function cleanupExpiredIdleWorkers(
     }
   }
   return result;
+}
+
+function readManagedGuardConfig(
+  channel: string,
+  worker: string,
+  project: string,
+): ManagedGuardConfig | undefined {
+  try {
+    const config = JSON.parse(
+      fs.readFileSync(workerFile(channel, worker, "config", project), "utf8"),
+    ) as { managed?: unknown };
+    const managed = config.managed;
+    if (
+      typeof managed !== "object" ||
+      managed === null ||
+      Array.isArray(managed)
+    ) {
+      return undefined;
+    }
+    const record = managed as Record<string, unknown>;
+    if (
+      typeof record.taskPath !== "string" ||
+      typeof record.workerRunId !== "object" ||
+      record.workerRunId === null
+    ) {
+      return undefined;
+    }
+    return {
+      taskPath: record.taskPath,
+      workerRunId: record.workerRunId as SerializedChannelId,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 export interface EnforceBudgetInput {

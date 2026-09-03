@@ -38,6 +38,8 @@ export interface ScheduleIdleTimerArgs {
   /** Returns true once the child process has exited. */
   isChildExited: () => boolean;
   log: { write: (data: string) => void };
+  /** Managed runs record an observation instead of invoking shutdown. */
+  onIdleTimeout?: () => void;
 }
 
 /**
@@ -47,7 +49,7 @@ export interface ScheduleIdleTimerArgs {
 export function scheduleSupervisorIdleTimer(
   args: ScheduleIdleTimerArgs,
 ): IdleTimerHandle {
-  const { idleTimeoutMs, shutdown, isChildExited, log } = args;
+  const { idleTimeoutMs, shutdown, isChildExited, log, onIdleTimeout } = args;
   if (idleTimeoutMs <= 0) {
     return {
       reset: () => undefined,
@@ -70,6 +72,13 @@ export function scheduleSupervisorIdleTimer(
     timer = undefined;
     if (cancelled) return;
     if (shutdown.isShuttingDown() || isChildExited()) {
+      return;
+    }
+    if (onIdleTimeout) {
+      log.write(
+        `[supervisor] idle timeout ${idleTimeoutMs}ms reached, recording managed observation\n`,
+      );
+      onIdleTimeout();
       return;
     }
     log.write(

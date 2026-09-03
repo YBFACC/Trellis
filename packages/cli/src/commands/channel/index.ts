@@ -294,6 +294,30 @@ export function registerChannelCommand(program: Command): void {
     .option("--model <id>", "model override")
     .option("--resume <id>", "resume an existing session/thread id")
     .option(
+      "--task <path>",
+      "explicit task path for structured managed dispatch",
+    )
+    .option("--package-id <id>", "managed work-package identifier")
+    .option(
+      "--write-scope <path>",
+      "managed write-scope path (repeatable)",
+      (val: string, prev: string[] | undefined) => [...(prev ?? []), val],
+      [] as string[],
+    )
+    .option(
+      "--finding-id <id>",
+      "managed finding identifier (repeatable)",
+      (val: string, prev: string[] | undefined) => [...(prev ?? []), val],
+      [] as string[],
+    )
+    .option("--previous-report-path <path>", "managed prior report path")
+    .option("--last-evidence <text>", "managed handoff evidence")
+    .option("--round-id <id>", "managed dispatch round identifier")
+    .option(
+      "--predecessor-worker-run-id <id>",
+      "terminal managed run replaced by this dispatch",
+    )
+    .option(
       "--sandbox <mode>",
       "codex-only: worker sandbox mode: read-only | workspace-write | danger-full-access (default workspace-write)",
     )
@@ -342,6 +366,14 @@ export function registerChannelCommand(program: Command): void {
         cwd?: string;
         model?: string;
         resume?: string;
+        task?: string;
+        packageId?: string;
+        writeScope?: string[];
+        findingId?: string[];
+        previousReportPath?: string;
+        lastEvidence?: string;
+        roundId?: string;
+        predecessorWorkerRunId?: string;
         sandbox?: string;
         timeout?: string;
         warnBefore?: string;
@@ -369,6 +401,14 @@ export function registerChannelCommand(program: Command): void {
           cwd: opts.cwd,
           model: opts.model,
           resume: opts.resume,
+          taskPath: opts.task,
+          packageId: opts.packageId,
+          writeScope: opts.writeScope,
+          findingIds: opts.findingId,
+          previousReportPath: opts.previousReportPath,
+          lastEvidence: opts.lastEvidence,
+          roundId: opts.roundId,
+          predecessorWorkerRunId: opts.predecessorWorkerRunId,
           sandbox,
           timeoutMs: parseDuration(opts.timeout),
           warnBeforeMs: parseDuration(opts.warnBefore),

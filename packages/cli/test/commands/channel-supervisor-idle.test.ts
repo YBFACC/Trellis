@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  scheduleSupervisorTimeout,
+} from "../../src/commands/channel/supervisor.js";
 import { scheduleSupervisorIdleTimer } from "../../src/commands/channel/supervisor/idle.js";
 import type { ShutdownController } from "../../src/commands/channel/supervisor/shutdown.js";
 import { TurnTracker } from "../../src/commands/channel/supervisor/turns.js";
@@ -146,6 +149,37 @@ describe("scheduleSupervisorIdleTimer", () => {
       "SIGTERM",
       "idle-timeout",
     );
+  });
+
+  it("records managed idle expiration through its callback without shutdown", () => {
+    const shutdown = fakeShutdown();
+    const onIdleTimeout = vi.fn();
+    scheduleSupervisorIdleTimer({
+      idleTimeoutMs: 1000,
+      shutdown,
+      isChildExited: () => false,
+      log: silentLog,
+      onIdleTimeout,
+    });
+
+    vi.advanceTimersByTime(1000);
+    expect(onIdleTimeout).toHaveBeenCalledTimes(1);
+    expect(shutdown.request).not.toHaveBeenCalled();
+  });
+
+  it("records managed lifetime timeout through its callback without shutdown", () => {
+    const shutdown = fakeShutdown();
+    const onManagedTimeout = vi.fn();
+    scheduleSupervisorTimeout({
+      timeoutMs: 1000,
+      shutdown,
+      log: silentLog,
+      onManagedTimeout,
+    });
+
+    vi.advanceTimersByTime(1000);
+    expect(onManagedTimeout).toHaveBeenCalledTimes(1);
+    expect(shutdown.request).not.toHaveBeenCalled();
   });
 });
 
