@@ -17,7 +17,7 @@ import {
   reduceChannelMetadata,
   type ChannelEvent,
   type ChannelMetadata,
-} from "@mindfoldhq/trellis-core/channel";
+} from "@ybfacc/trellis-core/channel";
 
 import { eventsPath } from "./paths.js";
 
@@ -32,7 +32,7 @@ export {
   reduceChannelMetadata,
   appendEvent,
   readLastSeq,
-} from "@mindfoldhq/trellis-core/channel";
+} from "@ybfacc/trellis-core/channel";
 
 export type {
   ChannelEvent,
@@ -49,7 +49,7 @@ export type {
   ProgressChannelEvent,
   SupervisorWarningChannelEvent,
   AppendablePartial,
-} from "@mindfoldhq/trellis-core/channel";
+} from "@ybfacc/trellis-core/channel";
 
 export async function readChannelEvents(
   name: string,

@@ -31,7 +31,7 @@ import {
   verifyWorkerRunPrompt,
   type InboxPolicy,
   type SerializedWorkerRunId,
-} from "@mindfoldhq/trellis-core/channel";
+} from "@ybfacc/trellis-core/channel";
 
 import { shouldUseSystemPromptFile } from "./adapters/claude.js";
 import type { CodexSandboxMode } from "./adapters/codex.js";

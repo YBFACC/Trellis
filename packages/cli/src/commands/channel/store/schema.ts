@@ -19,7 +19,7 @@ export {
   asStringArray,
   asContextEntries,
   buildContextEntries,
-} from "@mindfoldhq/trellis-core/channel";
+} from "@ybfacc/trellis-core/channel";
 
 export type {
   ChannelScope,
@@ -31,10 +31,10 @@ export type {
   RawContextEntry,
   ThreadAction,
   EventOrigin,
-} from "@mindfoldhq/trellis-core/channel";
+} from "@ybfacc/trellis-core/channel";
 
-import { buildContextEntries } from "@mindfoldhq/trellis-core/channel";
-import type { ContextEntry } from "@mindfoldhq/trellis-core/channel";
+import { buildContextEntries } from "@ybfacc/trellis-core/channel";
+import type { ContextEntry } from "@ybfacc/trellis-core/channel";
 
 /**
  * CSV parser kept colocated with the schema for CLI command files that

@@ -1,5 +1,5 @@
 {
-  "name": "@mindfoldhq/trellis",
+  "name": "@ybfacc/trellis",
   "version": "0.6.16",
   "description": "AI capabilities grow like ivy — Trellis provides the structure to guide them along a disciplined path",
   "type": "module",
@@ -52,7 +52,7 @@
   "author": "Mindfold LLC",
   "license": "AGPL-3.0-only",
   "dependencies": {
-    "@mindfoldhq/trellis-core": "workspace:*",
+    "@ybfacc/trellis-core": "workspace:*",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
     "figlet": "^1.9.4",

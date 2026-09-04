@@ -5,7 +5,7 @@ import {
   acknowledgeStop,
   completeWorkerRun,
   requestGracefulStop,
-} from "@mindfoldhq/trellis-core/channel";
+} from "@ybfacc/trellis-core/channel";
 
 import { appendEvent } from "./store/events.js";
 import { withLock } from "./store/lock.js";

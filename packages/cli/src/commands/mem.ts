@@ -27,7 +27,7 @@ import {
   readCodexContextUsage,
   readMemContext,
   searchMemSessions,
-} from "@mindfoldhq/trellis-core/mem";
+} from "@ybfacc/trellis-core/mem";
 import type {
   MemFilter,
   MemPhase,
@@ -35,7 +35,7 @@ import type {
   MemSourceFilter,
   MemSourceKind,
   CodexContextUsage,
-} from "@mindfoldhq/trellis-core/mem";
+} from "@ybfacc/trellis-core/mem";
 
 // ---------- argv ----------
 

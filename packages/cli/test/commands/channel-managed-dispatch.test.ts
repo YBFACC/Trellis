@@ -12,7 +12,7 @@ import {
   readWorkerRunState,
   serializeWorkerRunId,
   startWorkerRun,
-} from "@mindfoldhq/trellis-core/channel";
+} from "@ybfacc/trellis-core/channel";
 
 import { createChannel } from "../../src/commands/channel/create.js";
 import { registerChannelCommand } from "../../src/commands/channel/index.js";

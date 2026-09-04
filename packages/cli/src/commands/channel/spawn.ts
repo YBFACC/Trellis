@@ -13,7 +13,7 @@ import {
   normalizeWorkerRunRole,
   serializeWorkerRunId,
   type InboxPolicy,
-} from "@mindfoldhq/trellis-core/channel";
+} from "@ybfacc/trellis-core/channel";
 
 import { loadAgent } from "./agent-loader.js";
 import type { CodexSandboxMode } from "./adapters/codex.js";
