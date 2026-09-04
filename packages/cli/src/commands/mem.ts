@@ -10,6 +10,7 @@
  *   search <keyword>              find sessions whose contents match keyword
  *   context <session-id>          drill-down: top-N hit turns + surrounding context
  *   extract <session-id>          dump cleaned dialogue (use --grep KW to filter turns)
+ *   usage <agent-id>              read persisted native Codex active-context usage
  *   projects                      list active project cwds (AI-routing entry point)
  *
  * Run `trellis mem help` for the full flag reference.
@@ -23,6 +24,7 @@ import {
   listMemProjects,
   listMemSessions,
   MemSessionNotFoundError,
+  readCodexContextUsage,
   readMemContext,
   searchMemSessions,
 } from "@mindfoldhq/trellis-core/mem";
@@ -32,6 +34,7 @@ import type {
   MemSessionInfo,
   MemSourceFilter,
   MemSourceKind,
+  CodexContextUsage,
 } from "@mindfoldhq/trellis-core/mem";
 
 // ---------- argv ----------
@@ -452,6 +455,62 @@ function cmdExtract(argv: Argv): void {
   }
 }
 
+function usageJson(result: CodexContextUsage): {
+  status: string;
+  agent_id: string | null;
+  used_tokens: number | null;
+  model_context_window: number | null;
+  used_percentage: number | null;
+  remaining_percentage: number | null;
+  percentage: {
+    mode: "model_context_window_ratio";
+    baseline_tokens: number | null;
+    decimal_places: 2;
+  };
+} {
+  return {
+    status: result.status,
+    agent_id: result.agentId,
+    used_tokens: result.usedTokens,
+    model_context_window: result.modelContextWindow,
+    used_percentage: result.usedPercentage,
+    remaining_percentage: result.remainingPercentage,
+    percentage: {
+      mode: result.percentage.mode,
+      baseline_tokens: result.percentage.baselineTokens,
+      decimal_places: result.percentage.decimalPlaces,
+    },
+  };
+}
+
+function cmdUsage(argv: Argv): void {
+  if (argv.positional.length !== 1) {
+    die("usage: usage <agent-id> [--json]");
+  }
+  const unsupportedFlag = Object.keys(argv.flags).find((key) => key !== "json");
+  if (unsupportedFlag) die(`usage does not support --${unsupportedFlag}`);
+
+  const agentId = argv.positional[0];
+  if (!agentId) die("usage: usage <agent-id> [--json]");
+  const result = readCodexContextUsage(agentId);
+  const output = usageJson(result);
+  if (argv.flags.json) {
+    console.log(JSON.stringify(output, null, 2));
+    return;
+  }
+
+  console.log(`# usage: ${output.status}`);
+  if (output.agent_id) console.log(`# agent_id: ${output.agent_id}`);
+  if (output.used_tokens !== null)
+    console.log(`# used_tokens: ${output.used_tokens}`);
+  if (output.model_context_window !== null)
+    console.log(`# model_context_window: ${output.model_context_window}`);
+  if (output.used_percentage !== null && output.remaining_percentage !== null)
+    console.log(
+      `# context: ${output.used_percentage}% used / ${output.remaining_percentage}% remaining (${output.percentage.mode})`,
+    );
+}
+
 function cmdHelp(): void {
   console.log(`trellis mem — list/search Claude/Codex/Grok/OpenCode/Pi/ZCode sessions
 
@@ -461,6 +520,7 @@ commands:
   context <session-id>          drill-down: top-N hit turns + surrounding context
                                 (paired with search; use --grep KW to anchor)
   extract <session-id>          dump cleaned dialogue (use --grep KW to filter turns)
+  usage <agent-id>              read persisted native Codex active-context usage
   projects                      list active projects (cwds) with session counts —
                                 use this to discover which --cwd to pass to search
 
@@ -488,6 +548,7 @@ examples:
   trellis mem search "session insight" --global
   trellis mem extract 5842592d --grep memory
   trellis mem extract 5842592d --phase brainstorm
+  trellis mem usage 01900000-0000-7000-8000-000000000000 --json
 `);
 }
 
@@ -512,6 +573,8 @@ export function runMem(args: readonly string[]): void {
       return cmdExtract(argv);
     case "context":
       return cmdContext(argv);
+    case "usage":
+      return cmdUsage(argv);
     case "projects":
       return cmdProjects(argv);
     default:

@@ -23,6 +23,8 @@ export { readMemContext } from "./context.js";
 
 export { listMemProjects } from "./projects.js";
 
+export { readCodexContextUsage } from "./adapters/codex.js";
+
 export type {
   MemSourceKind,
   MemSourceFilter,
@@ -34,6 +36,9 @@ export type {
   SearchExcerpt,
   SearchHit,
   MemWarning,
+  CodexContextUsageStatus,
+  CodexContextUsagePercentage,
+  CodexContextUsage,
   MemSearchMatch,
   MemSearchResult,
   MemContextTurn,

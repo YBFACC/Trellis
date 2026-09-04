@@ -84,6 +84,36 @@ export interface MemWarning {
   message: string;
 }
 
+/** Outcome of resolving a persisted native Codex subagent rollout. */
+export type CodexContextUsageStatus =
+  | "available"
+  | "invalid_agent_id"
+  | "rollout_not_found"
+  | "token_count_not_found"
+  | "last_token_usage_unavailable"
+  | "model_context_window_unavailable";
+
+/** Explicit denominator and rounding contract for context-usage percentages. */
+export interface CodexContextUsagePercentage {
+  mode: "model_context_window_ratio";
+  baselineTokens: number | null;
+  decimalPlaces: 2;
+}
+
+/**
+ * Read-only projection of the latest persisted Codex context usage. `null`
+ * means the field was unavailable, never that the value was measured as zero.
+ */
+export interface CodexContextUsage {
+  status: CodexContextUsageStatus;
+  agentId: string | null;
+  usedTokens: number | null;
+  modelContextWindow: number | null;
+  usedPercentage: number | null;
+  remainingPercentage: number | null;
+  percentage: CodexContextUsagePercentage;
+}
+
 export interface MemSearchMatch {
   session: MemSessionInfo;
   /** Weighted-density relevance score. */

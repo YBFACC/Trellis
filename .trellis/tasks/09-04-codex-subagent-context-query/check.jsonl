@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/cli/backend/quality-guidelines.md", "reason": "Backend quality and forbidden-pattern review"}
+{"file": ".trellis/spec/cli/unit-test/conventions.md", "reason": "Required test structure and isolation"}
+{"file": ".trellis/spec/cli/unit-test/integration-patterns.md", "reason": "Command-level integration verification"}
+{"file": ".trellis/spec/cli/backend/filesystem-safety.md", "reason": "Read-only filesystem and path safety verification"}

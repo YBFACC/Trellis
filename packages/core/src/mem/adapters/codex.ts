@@ -33,12 +33,18 @@ import {
 } from "../dialogue.js";
 import { inRangeOverlap, sameProject } from "../filter.js";
 import { readJsonl, readJsonlFirst } from "../internal/jsonl.js";
-import { CODEX_SESSIONS, walkDir } from "../internal/paths.js";
+import {
+  CODEX_ARCHIVED_SESSIONS,
+  CODEX_SESSIONS,
+  walkDir,
+} from "../internal/paths.js";
 import { parseTaskPyCommandsAll } from "../phase.js";
 import { searchInDialogue } from "../search.js";
 import type {
   DialogueRole,
   DialogueTurn,
+  CodexContextUsage,
+  CodexContextUsageStatus,
   MemFilter,
   MemSessionInfo,
   MemWarning,
@@ -68,12 +74,151 @@ interface CodexPayload {
   replacement_history?: CodexCompactedItem[];
   name?: unknown;
   arguments?: unknown;
+  info?: unknown;
 }
 
 interface CodexEvent {
   timestamp?: string;
   type?: string;
   payload?: CodexPayload;
+}
+
+const CODEX_AGENT_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CODEX_ROLLOUT_FILENAME =
+  /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(.+)\.jsonl$/;
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function nonNegativeSafeInteger(value: unknown): number | undefined {
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+    ? value
+    : undefined;
+}
+
+function positiveSafeInteger(value: unknown): number | undefined {
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value > 0
+    ? value
+    : undefined;
+}
+
+function emptyContextUsage(
+  status: CodexContextUsageStatus,
+  agentId: string | null,
+): CodexContextUsage {
+  return {
+    status,
+    agentId,
+    usedTokens: null,
+    modelContextWindow: null,
+    usedPercentage: null,
+    remainingPercentage: null,
+    percentage: {
+      mode: "model_context_window_ratio",
+      baselineTokens: null,
+      decimalPlaces: 2,
+    },
+  };
+}
+
+function roundPercentage(value: number): number {
+  return Math.round(Math.min(100, Math.max(0, value)) * 100) / 100;
+}
+
+function rolloutAgentId(file: string): string | undefined {
+  const first = readJsonlFirst<CodexEvent>(file);
+  if (typeof first?.payload?.id === "string") return first.payload.id;
+  return path.basename(file).match(CODEX_ROLLOUT_FILENAME)?.[1];
+}
+
+function findCodexRollout(agentId: string): string | undefined {
+  let newest: { file: string; mtimeMs: number } | undefined;
+  for (const root of [CODEX_SESSIONS, CODEX_ARCHIVED_SESSIONS]) {
+    for (const file of walkDir(root)) {
+      if (!file.endsWith(".jsonl")) continue;
+      if (rolloutAgentId(file)?.toLowerCase() !== agentId) continue;
+      try {
+        const { mtimeMs } = fs.statSync(file);
+        if (!newest || mtimeMs > newest.mtimeMs) newest = { file, mtimeMs };
+      } catch {
+        // The rollout may be moved between discovery and stat; skip it.
+      }
+    }
+  }
+  return newest?.file;
+}
+
+/**
+ * Return the latest persisted active-context usage for a native Codex agent.
+ * This reads only scalar usage fields from the selected rollout and never
+ * returns its path, dialogue, prompts, or tool payloads.
+ */
+export function readCodexContextUsage(agentIdRaw: string): CodexContextUsage {
+  if (!CODEX_AGENT_ID.test(agentIdRaw)) {
+    return emptyContextUsage("invalid_agent_id", null);
+  }
+  const agentId = agentIdRaw.toLowerCase();
+  const file = findCodexRollout(agentId);
+  if (!file) return emptyContextUsage("rollout_not_found", agentId);
+
+  let latestInfo: unknown;
+  let foundTokenCount = false;
+  readJsonl<CodexEvent>(file, (event) => {
+    if (event.type !== "event_msg" || event.payload?.type !== "token_count") {
+      return;
+    }
+    foundTokenCount = true;
+    latestInfo = event.payload.info;
+  });
+
+  if (!foundTokenCount) return emptyContextUsage("token_count_not_found", agentId);
+
+  const info = recordValue(latestInfo);
+  const lastUsage = recordValue(info?.last_token_usage);
+  const usedTokens = nonNegativeSafeInteger(lastUsage?.total_tokens);
+  const modelContextWindow = positiveSafeInteger(info?.model_context_window);
+  if (usedTokens === undefined) {
+    return {
+      ...emptyContextUsage("last_token_usage_unavailable", agentId),
+      modelContextWindow: modelContextWindow ?? null,
+      percentage: {
+        mode: "model_context_window_ratio",
+        baselineTokens: modelContextWindow ?? null,
+        decimalPlaces: 2,
+      },
+    };
+  }
+  if (modelContextWindow === undefined) {
+    return {
+      ...emptyContextUsage("model_context_window_unavailable", agentId),
+      usedTokens,
+    };
+  }
+
+  const usedPercentage = roundPercentage(
+    (usedTokens / modelContextWindow) * 100,
+  );
+  return {
+    status: "available",
+    agentId,
+    usedTokens,
+    modelContextWindow,
+    usedPercentage,
+    remainingPercentage: roundPercentage(100 - usedPercentage),
+    percentage: {
+      mode: "model_context_window_ratio",
+      baselineTokens: modelContextWindow,
+      decimalPlaces: 2,
+    },
+  };
 }
 
 function parseDialogueRole(v: unknown): DialogueRole | undefined {

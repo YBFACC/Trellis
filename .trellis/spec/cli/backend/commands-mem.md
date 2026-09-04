@@ -18,7 +18,7 @@ CLIs already drop on disk:
 | Platform    | Session root                                                                                       |
 | ----------- | -------------------------------------------------------------------------------------------------- |
 | Claude Code | `~/.claude/projects/<sanitized-cwd>/<id>.jsonl`                                                    |
-| Codex       | `~/.codex/sessions/**/rollout-<ts>-<id>.jsonl`                                                     |
+| Codex       | `~/.codex/sessions/**/rollout-<ts>-<id>.jsonl` (usage queries also inspect `~/.codex/archived_sessions`) |
 | OpenCode    | Reader unavailable in 0.6.0-beta.4 (reverted, see Notes)                                           |
 | Pi Agent    | `~/.pi/agent/sessions/--<encoded-cwd>--/<timestamp>_<id>.jsonl` or env/settings custom session dir |
 | ZCode       | `~/.zcode/cli/db/db.sqlite` plus active `db.sqlite-wal` / `db.sqlite-shm` files                    |
@@ -97,6 +97,7 @@ core `MemFilter`.
 | `search <kw>`            | `commands/mem.ts:cmdSearch`   | Multi-token AND grep over cleaned dialogue across all matching sessions; ranks by weighted relevance score; emits per-session excerpts.                                                   |
 | `context <id>`           | `commands/mem.ts:cmdContext`  | Drill-down on a single session: top-N hit turns + N turns of context on either side, char-budgeted. With no `--grep`, returns the first N turns (session opening).                        |
 | `extract <id>`           | `commands/mem.ts:cmdExtract`  | Dump full cleaned dialogue for one session; `--grep` filters turns by AND-substring.                                                                                                      |
+| `usage <agent-id>`       | `commands/mem.ts:cmdUsage`    | Read the latest persisted active-context usage for one native Codex child, without returning dialogue or a rollout path.                                                                   |
 | `projects`               | `commands/mem.ts:cmdProjects` | Aggregate distinct cwds across platforms with last-active timestamp + per-platform counts. AI uses this as a directory of "门牌号" (project paths) before picking a `--cwd` for `search`. |
 | `help` / `--help` / `-h` | `commands/mem.ts:cmdHelp`     | Print full flag reference.                                                                                                                                                                |
 
@@ -123,6 +124,120 @@ Subcommand-specific:
 | `--max-chars N`      | `context`            | `6000` (~1500 tokens) | Total char budget. Per-turn cap is `floor(N/2)`; turns exceeding it are head-truncated with `…[+X chars]`.                                                         |
 | `--include-children` | `search`, `context`  | off                   | Merge OpenCode sub-agent descendants into parent before search/context (only OpenCode populates `parent_id`). No-op in 0.6.0-beta.4 (OpenCode reader unavailable). |
 | `--json`             | all                  | off                   | Machine-readable output for AI consumption.                                                                                                                        |
+
+---
+
++### Scenario: Native Codex subagent context usage
+
+#### 1. Scope / Trigger
+
+Use `trellis mem usage` when a Main Agent needs a child Codex thread's latest
+persisted active-context size for a continuation or handoff decision. It is an
+offline, read-only projection of rollout telemetry, not live monitoring and not
+a dialogue retrieval command.
+
+#### 2. Signatures
+
+```text
+trellis mem usage <agent-id> [--json]
+
+readCodexContextUsage(agentId: string): CodexContextUsage
+```
+
+`agent-id` must be a UUID-shaped native Codex thread id. The command is
+Codex-only and global: it deliberately does not accept `--cwd`, `--global`,
+`--platform`, date, or display-limit flags.
+
+#### 3. Contracts
+
+- Core scans `~/.codex/sessions` and `~/.codex/archived_sessions` lazily.
+  The first parseable event's `payload.id` selects a rollout; the standard
+  `rollout-<timestamp>-<id>.jsonl` suffix is only a missing-header fallback.
+  If duplicate matching files exist, the newest `mtime` wins.
+- Core streams only that rollout through the canonical `readJsonl` reader and
+  retains the final `event_msg` where `payload.type === "token_count"`.
+  It must use `info.last_token_usage.total_tokens`, never cumulative
+  `info.total_token_usage.total_tokens`.
+- `info.model_context_window` is the percentage baseline. Core reports
+  `round(clamp(used / window * 100, 0, 100), 2)` and `100 - used_percentage`;
+  the descriptor is `model_context_window_ratio`, not an assertion about
+  undocumented TUI rounding.
+- `--json` emits exactly one object with stable snake_case fields:
+
+```json
+{
+  "status": "available",
+  "agent_id": "01900000-0000-7000-8000-000000000000",
+  "used_tokens": 250,
+  "model_context_window": 1000,
+  "used_percentage": 25,
+  "remaining_percentage": 75,
+  "percentage": {
+    "mode": "model_context_window_ratio",
+    "baseline_tokens": 1000,
+    "decimal_places": 2
+  }
+}
+```
+
+Never include `filePath`, a rollout path, prompt, message, tool payload, or
+raw event object in this result. Unavailable measurements are `null`, never a
+synthetic zero.
+
+#### 4. Validation & Error Matrix
+
+| Condition | `status` | Measurement fields |
+| --- | --- | --- |
+| UUID is malformed | `invalid_agent_id` | all `null`, including `agent_id` |
+| No active or archived rollout matches | `rollout_not_found` | all measurements `null` |
+| Matching rollout has no token-count event | `token_count_not_found` | all measurements `null` |
+| Latest token-count event lacks a non-negative safe `last_token_usage.total_tokens` | `last_token_usage_unavailable` | `used_tokens` and percentages `null`; a valid window may remain visible |
+| Latest event lacks a positive safe context window | `model_context_window_unavailable` | established `used_tokens`; window and percentages `null` |
+| Required positional argument is absent or a disallowed flag is passed | CLI exit 2 | no result object |
+
+Malformed JSONL rows and rollouts that disappear between discovery and reading
+are ignored/fail closed through the same explicit unavailable states; they must
+never produce a traceback.
+
+#### 5. Good / Base / Bad Cases
+
+- **Good**: a child has `last_token_usage.total_tokens: 250`, a cumulative
+  total of `999999`, and `model_context_window: 1000`; output reports `250`,
+  `25`, and `75`.
+- **Base**: the child was archived; the same UUID still resolves from
+  `~/.codex/archived_sessions` without the caller knowing its file path.
+- **Bad**: reading `total_token_usage.total_tokens` as active context can
+  falsely show usage above 100%; returning the raw token event leaks unrelated
+  persisted data.
+
+#### 6. Tests Required
+
+- Core adapter fixtures must cover active and archived discovery, newest-file
+  selection, latest-event selection, malformed rows, invalid id, no rollout,
+  no token-count event, absent active usage/window, rounding/clamping, and a
+  cumulative total larger than the window.
+- CLI integration must assert exact `--json` fields, no path/payload leakage,
+  no rollout mutation, help registration, unavailable JSON, and unsupported
+  flag exit behavior.
+
+#### 7. Wrong vs Correct
+
+Wrong — parse the rollout in the CLI and trust cumulative usage:
+
+```ts
+const all = JSON.parse(fs.readFileSync(rollout, "utf8"));
+return all.info.total_token_usage.total_tokens;
+```
+
+Correct — preserve Core ownership and stream only the final scalar projection:
+
+```ts
+const result = readCodexContextUsage(agentId);
+console.log(JSON.stringify(toUsageJson(result)));
+```
+
+This keeps external JSONL shape guards in one adapter, preserves bounded
+memory, and prevents the CLI from becoming another raw-session parser.
 
 ---
 
@@ -962,6 +1077,7 @@ checks. The public domain types live in `core/mem/types.ts`:
 | `BrainstormWindow` / `MemDialogueGroup` / `MemExtractResult`         | phase-slicing output                                                |
 | `MemProjectSummary`                                                  | project aggregation output                                          |
 | `MemWarning`                                                         | structured warning returned to the CLI                              |
+| `CodexContextUsageStatus` / `CodexContextUsage`                     | native Codex usage-query outcome and scalar projection              |
 
 The loose per-platform event interfaces (`CodexEvent`, `CodexPayload`,
 `ClaudeEvent`, …) stay local to their adapter file.
@@ -1017,7 +1133,7 @@ Core tests (`packages/core/test/mem/`):
 | File                | What it covers                                                                                                                                                                     |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `helpers.test.ts`   | filtering / cleaning / search primitives: `inRange`, `inRangeOverlap`, `sameProject`, `stripInjectionTags`, `isBootstrapTurn`, `chunkAround`, `searchInDialogue`, `relevanceScore` |
-| `adapters.test.ts`  | per-platform `*ListSessions` / `*ExtractDialogue` / `*Search` against synthetic JSONL / JSON fixtures with mocked `os.homedir()`                                                   |
+| `adapters.test.ts`  | per-platform `*ListSessions` / `*ExtractDialogue` / `*Search`, plus native Codex usage discovery/projection fixtures, with mocked `os.homedir()`                                    |
 | `phase.test.ts`     | `parseTaskPyCommand(sAll)`, `commandFromCodexArguments`, `collectClaudeTurnsAndEvents`, `collectCodexTurnsAndEvents`, `collectPiTurnsAndEvents`, `buildBrainstormWindows`          |
 | `cross-day.test.ts` | cross-day session must survive `--since` later than `created`; pins the `inRangeOverlap` contract                                                                                  |
 | `api.test.ts`       | the public orchestration API (`listMemSessions`, `searchMemSessions`, `readMemContext`, `extractMemDialogue`, `listMemProjects`) returning structured results + warnings           |
@@ -1027,7 +1143,7 @@ CLI tests (`packages/cli/test/commands/`):
 | File                      | What it covers                                                                                                        |
 | ------------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `mem-helpers.test.ts`     | CLI-only helpers: `parseArgv`, CLI flag → `MemFilter` translation, `shortDate`, `shortPath`                           |
-| `mem-integration.test.ts` | end-to-end `runMem` with stdout capture, `--json` output shape, exit behavior, the OpenCode-unavailable stderr notice |
+| `mem-integration.test.ts` | end-to-end `runMem` with stdout capture, `--json` output shape, `usage` no-leak/no-write behavior, exit behavior, and the OpenCode-unavailable stderr notice |
 
 ### Fixture pattern (core adapter tests)
 
@@ -1094,9 +1210,9 @@ consumers. Exposed only on the `/mem` subpath — **not** the root barrel.
 
 | Export                                                                                                                                                      | Use                                                                                        |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `listMemSessions`, `searchMemSessions`, `readMemContext`, `extractMemDialogue`, `listMemProjects`                                                           | five orchestration entry points; search/context/extract return `warnings`, list/projects accept `onWarning` |
+| `listMemSessions`, `searchMemSessions`, `readMemContext`, `extractMemDialogue`, `listMemProjects`, `readCodexContextUsage`                                 | persisted-session orchestration; usage returns a structured read-only Codex scalar projection |
 | `MemSessionNotFoundError`                                                                                                                                   | typed error for `context` / `extract` against an unknown session id                        |
-| `MemSessionInfo`, `MemFilter`, `DialogueTurn`, `SearchHit`, `MemSearchResult`, `MemContextResult`, `MemExtractResult`, `MemProjectSummary`, `MemWarning`, … | input/output types (see `core/mem/types.ts`)                                               |
+| `MemSessionInfo`, `MemFilter`, `DialogueTurn`, `SearchHit`, `MemSearchResult`, `MemContextResult`, `MemExtractResult`, `MemProjectSummary`, `MemWarning`, `CodexContextUsage`, … | input/output types (see `core/mem/types.ts`)                                               |
 
 Internal core modules (`filter.ts`, `search.ts`, `dialogue.ts`, `context.ts`,
 `phase.ts`, the adapters, and everything under `internal/`) are exercised

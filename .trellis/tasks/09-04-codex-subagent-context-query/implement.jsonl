@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/cli/backend/commands-mem.md", "reason": "Core versus CLI mem ownership, stable JSON output, and subcommand conventions"}
+{"file": ".trellis/spec/cli/backend/trellis-core-sdk.md", "reason": "Public Core subpath export and CLI dependency boundary"}
+{"file": ".trellis/spec/cli/backend/filesystem-safety.md", "reason": "Safe rollout discovery and identifier validation"}
+{"file": ".trellis/spec/guides/cross-platform-thinking-guide.md", "reason": "Cross-platform path and Python execution assumptions"}

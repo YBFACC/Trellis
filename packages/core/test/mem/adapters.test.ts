@@ -66,8 +66,12 @@ const { claudeListSessions, claudeExtractDialogue, claudeSearch } =
   await import("../../src/mem/adapters/claude.js");
 const { claudeProjectDirFromCwd } =
   await import("../../src/mem/internal/paths.js");
-const { codexListSessions, codexExtractDialogue, codexSearch } =
-  await import("../../src/mem/adapters/codex.js");
+const {
+  codexListSessions,
+  codexExtractDialogue,
+  codexSearch,
+  readCodexContextUsage,
+} = await import("../../src/mem/adapters/codex.js");
 const {
   grokListSessions,
   grokExtractDialogue,
@@ -106,6 +110,11 @@ function mkFilter(overrides: Partial<MemFilter> = {}): MemFilter {
 
 const CLAUDE_PROJECTS = nodePath.join(fakeHome, ".claude", "projects");
 const CODEX_SESSIONS = nodePath.join(fakeHome, ".codex", "sessions");
+const CODEX_ARCHIVED_SESSIONS = nodePath.join(
+  fakeHome,
+  ".codex",
+  "archived_sessions",
+);
 const GROK_SESSIONS = nodePath.join(fakeHome, ".grok", "sessions");
 const PI_SESSIONS = nodePath.join(fakeHome, ".pi", "agent", "sessions");
 
@@ -513,6 +522,7 @@ describe("codexListSessions / codexExtractDialogue", () => {
 
   afterEach(() => {
     rimraf(CODEX_SESSIONS);
+    rimraf(CODEX_ARCHIVED_SESSIONS);
   });
 
   it("returns no sessions when ~/.codex/sessions/ doesn't exist", () => {
@@ -835,6 +845,151 @@ describe("codexListSessions / codexExtractDialogue", () => {
     const hit = codexSearch(s, "memory");
     expect(hit.userCount).toBe(1);
     expect(hit.count).toBe(1);
+  });
+});
+
+// =============================================================================
+// Codex persisted context usage
+// =============================================================================
+
+describe("readCodexContextUsage", () => {
+  const agentId = "01900000-0000-7000-8000-000000000001";
+
+  function rolloutFile(root: string, suffix = agentId): string {
+    return nodePath.join(
+      root,
+      "2026",
+      "09",
+      "04",
+      `rollout-2026-09-04T10-00-00-${suffix}.jsonl`,
+    );
+  }
+
+  function tokenCount(
+    lastTotal: unknown,
+    contextWindow: unknown,
+    accumulatedTotal = 999_999,
+  ): Record<string, unknown> {
+    return {
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: { total_tokens: accumulatedTotal },
+          last_token_usage: { total_tokens: lastTotal },
+          model_context_window: contextWindow,
+        },
+      },
+    };
+  }
+
+  function header(id = agentId): Record<string, unknown> {
+    return { type: "session_meta", payload: { id } };
+  }
+
+  afterEach(() => {
+    rimraf(CODEX_SESSIONS);
+    rimraf(CODEX_ARCHIVED_SESSIONS);
+  });
+
+  it("uses the final token_count event's active usage, not accumulated usage", () => {
+    const file = rolloutFile(CODEX_SESSIONS);
+    writeJsonl(file, [
+      header(),
+      tokenCount(30, 1_000, 120_000),
+      {
+        type: "response_item",
+        payload: { type: "message", content: "must-not-be-returned" },
+      },
+      tokenCount(125, 1_000, 900_000),
+    ]);
+    nodeFs.appendFileSync(file, "not valid json\n");
+
+    const result = readCodexContextUsage(agentId);
+
+    expect(result).toEqual({
+      status: "available",
+      agentId,
+      usedTokens: 125,
+      modelContextWindow: 1_000,
+      usedPercentage: 12.5,
+      remainingPercentage: 87.5,
+      percentage: {
+        mode: "model_context_window_ratio",
+        baselineTokens: 1_000,
+        decimalPlaces: 2,
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("must-not-be-returned");
+  });
+
+  it("discovers archived rollouts and selects the newest matching file", () => {
+    const activeFile = rolloutFile(CODEX_SESSIONS);
+    const archivedFile = rolloutFile(CODEX_ARCHIVED_SESSIONS);
+    writeJsonl(activeFile, [header(), tokenCount(5, 100)]);
+    writeJsonl(archivedFile, [header(), tokenCount(250, 100)]);
+    const older = new Date("2026-09-04T10:00:00.000Z");
+    const newer = new Date("2026-09-04T11:00:00.000Z");
+    nodeFs.utimesSync(activeFile, older, older);
+    nodeFs.utimesSync(archivedFile, newer, newer);
+
+    expect(readCodexContextUsage(agentId)).toMatchObject({
+      status: "available",
+      usedTokens: 250,
+      modelContextWindow: 100,
+      usedPercentage: 100,
+      remainingPercentage: 0,
+    });
+  });
+
+  it("reports explicit unavailable states without falling back to stale usage", () => {
+    const noTokenId = "01900000-0000-7000-8000-000000000002";
+    writeJsonl(rolloutFile(CODEX_SESSIONS, noTokenId), [header(noTokenId)]);
+
+    const incompleteId = "01900000-0000-7000-8000-000000000003";
+    writeJsonl(rolloutFile(CODEX_SESSIONS, incompleteId), [
+      header(incompleteId),
+      tokenCount(10, 100),
+      {
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: { model_context_window: 100 },
+        },
+      },
+    ]);
+
+    const noWindowId = "01900000-0000-7000-8000-000000000004";
+    writeJsonl(rolloutFile(CODEX_SESSIONS, noWindowId), [
+      header(noWindowId),
+      tokenCount(42, null),
+    ]);
+
+    expect(readCodexContextUsage("not-a-codex-id")).toMatchObject({
+      status: "invalid_agent_id",
+      agentId: null,
+      usedTokens: null,
+    });
+    expect(readCodexContextUsage("01900000-0000-7000-8000-000000000099")).toMatchObject({
+      status: "rollout_not_found",
+      usedTokens: null,
+    });
+    expect(readCodexContextUsage(noTokenId)).toMatchObject({
+      status: "token_count_not_found",
+      usedTokens: null,
+    });
+    expect(readCodexContextUsage(incompleteId)).toMatchObject({
+      status: "last_token_usage_unavailable",
+      usedTokens: null,
+      modelContextWindow: 100,
+    });
+    expect(readCodexContextUsage(noWindowId)).toMatchObject({
+      status: "model_context_window_unavailable",
+      usedTokens: 42,
+      modelContextWindow: null,
+      usedPercentage: null,
+      remainingPercentage: null,
+    });
   });
 });
 

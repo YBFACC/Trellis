@@ -46,6 +46,7 @@ const { runMem } = await import("../../src/commands/mem.js");
 // =============================================================================
 
 const CLAUDE_PROJECTS = nodePath.join(fakeHome, ".claude", "projects");
+const CODEX_SESSIONS = nodePath.join(fakeHome, ".codex", "sessions");
 const PI_SESSIONS = nodePath.join(fakeHome, ".pi", "agent", "sessions");
 const ZCODE_DB = nodePath.join(fakeHome, ".zcode", "cli", "db", "db.sqlite");
 const projectCwd = "/tmp/mem-int-project";
@@ -53,6 +54,7 @@ const encodedCwd = projectCwd.replace(/[/_]/g, "-");
 const projectDir = nodePath.join(CLAUDE_PROJECTS, encodedCwd);
 const sessionId = "deadbeef-1234-5678-9abc-def012345678";
 const sessionFile = nodePath.join(projectDir, `${sessionId}.jsonl`);
+const usageAgentId = "01900000-0000-7000-8000-000000000010";
 
 function piProjectDir(cwd: string): string {
   const safe = `--${nodePath
@@ -166,6 +168,35 @@ function seedClaudeSession(): void {
   ]);
 }
 
+function seedCodexUsage(): string {
+  const file = nodePath.join(
+    CODEX_SESSIONS,
+    "2026",
+    "09",
+    "04",
+    `rollout-2026-09-04T10-00-00-${usageAgentId}.jsonl`,
+  );
+  writeJsonl(file, [
+    { type: "session_meta", payload: { id: usageAgentId } },
+    {
+      type: "response_item",
+      payload: { type: "message", content: "must-not-appear-in-usage" },
+    },
+    {
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: { total_tokens: 999_999 },
+          last_token_usage: { total_tokens: 250 },
+          model_context_window: 1_000,
+        },
+      },
+    },
+  ]);
+  return file;
+}
+
 afterAll(() => {
   nodeFs.rmSync(fakeHome, { recursive: true, force: true });
 });
@@ -201,6 +232,10 @@ describe("runMem subcommand integration", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     nodeFs.rmSync(CLAUDE_PROJECTS, { recursive: true, force: true });
+    nodeFs.rmSync(nodePath.join(fakeHome, ".codex"), {
+      recursive: true,
+      force: true,
+    });
     nodeFs.rmSync(nodePath.join(fakeHome, ".pi"), {
       recursive: true,
       force: true,
@@ -369,6 +404,62 @@ describe("runMem subcommand integration", () => {
       /__exit__:2/,
     );
     expect(errs.join("\n")).toMatch(/session not found/);
+  });
+
+  // ---------- usage ----------
+
+  it("usage --json emits only the persisted active-context projection", () => {
+    const rollout = seedCodexUsage();
+    const before = nodeFs.readFileSync(rollout, "utf8");
+    const usageProject = nodePath.join(fakeHome, "usage-project");
+    const runtimeDir = nodePath.join(usageProject, ".trellis", ".runtime");
+    nodeFs.mkdirSync(nodePath.join(usageProject, ".trellis"), {
+      recursive: true,
+    });
+    vi.spyOn(process, "cwd").mockReturnValue(usageProject);
+
+    runMem(["usage", usageAgentId, "--json"]);
+
+    const parsed = JSON.parse(logs.join("\n")) as {
+      status: string;
+      agent_id: string;
+      used_tokens: number;
+      model_context_window: number;
+      used_percentage: number;
+      remaining_percentage: number;
+      percentage: { mode: string; baseline_tokens: number; decimal_places: number };
+    };
+    expect(parsed).toEqual({
+      status: "available",
+      agent_id: usageAgentId,
+      used_tokens: 250,
+      model_context_window: 1_000,
+      used_percentage: 25,
+      remaining_percentage: 75,
+      percentage: {
+        mode: "model_context_window_ratio",
+        baseline_tokens: 1_000,
+        decimal_places: 2,
+      },
+    });
+    expect(JSON.stringify(parsed)).not.toContain("must-not-appear-in-usage");
+    expect(JSON.stringify(parsed)).not.toContain("filePath");
+    expect(nodeFs.readFileSync(rollout, "utf8")).toBe(before);
+    expect(nodeFs.existsSync(runtimeDir)).toBe(false);
+  });
+
+  it("usage returns a structured unavailable result and rejects unsupported flags", () => {
+    runMem(["usage", "not-a-codex-id", "--json"]);
+    expect(JSON.parse(logs.join("\n"))).toMatchObject({
+      status: "invalid_agent_id",
+      agent_id: null,
+      used_tokens: null,
+    });
+
+    expect(() => runMem(["usage", usageAgentId, "--cwd", projectCwd])).toThrow(
+      /__exit__:2/,
+    );
+    expect(errs.join("\n")).toContain("usage does not support --cwd");
   });
 
   // ---------- extract ----------
@@ -668,6 +759,7 @@ describe("runMem subcommand integration", () => {
     runMem(["help"]);
     const joined = logs.join("\n");
     expect(joined).toContain("trellis mem");
+    expect(joined).toContain("usage <agent-id>");
     expect(joined).toContain("claude|codex|grok|opencode|pi|zcode|all");
   });
 
